@@ -177,3 +177,4 @@ venv/
 venvvenv/
 .env/
 .scml/
+scml/
