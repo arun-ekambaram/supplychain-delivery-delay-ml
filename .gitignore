@@ -178,3 +178,4 @@ venvvenv/
 .env/
 .scml/
 scml/
+data/
