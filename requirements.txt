@@ -5,3 +5,5 @@ seaborn
 matplotlib
 kagglehub
 python-dotenv
+
+# -e .
