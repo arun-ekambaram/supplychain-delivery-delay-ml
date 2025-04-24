@@ -5,5 +5,8 @@ seaborn
 matplotlib
 kagglehub
 python-dotenv
+scikit-learn
+shap
+xgboost
 
 # -e .
