@@ -29,6 +29,9 @@ class DataIngestionConfig:
         self.testing_file_path: str = os.path.join(
             self.data_ingestion_dir, training_pipeline.DATA_INGESTION_INGESTED_DIR,training_pipeline.TEST_FILE_NAME
         )
-       
+        self.training_file: str = training_pipeline.TRAIN_FILE_PATH
+        self.testing_file: str = training_pipeline.TEST_FILE_PATH
+        self.file_path: str = training_pipeline.TRAIN_FILE_PATH
+
 
 

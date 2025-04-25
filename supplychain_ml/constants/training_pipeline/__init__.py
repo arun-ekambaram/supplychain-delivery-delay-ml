@@ -14,7 +14,9 @@ ARTIFACT_DIR: str = "Artifacts"
 TRAIN_FILE_NAME: str = "train.csv"
 TEST_FILE_NAME: str =  "test.csv"
 FILE_NAME: str = "Supplychain.csv"
-
+FILE_PATH: str = "/Users/arunekambaram/Desktop/supplychain-ml/notebook/intel-train-finn3.csv"
+TRAIN_FILE_PATH: str = "/Users/arunekambaram/Desktop/supplychain-ml/notebook/intel-train-finn3.csv"
+TEST_FILE_PATH: str = "/Users/arunekambaram/Desktop/supplychain-ml/notebook/intel-test-finn3.csv"
 
 """
 Data Ingestion related constant start with DATA_INGESTION VAR NAME
