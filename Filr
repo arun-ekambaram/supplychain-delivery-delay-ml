@@ -1,0 +1,388 @@
+import pandas as pd
+import numpy as np
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import ColorScaleRule
+import warnings
+warnings.filterwarnings('ignore')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION  ← edit these to match your notebook variables
+# ─────────────────────────────────────────────────────────────────────────────
+DATE_COL        = "date_of_approval_void_decline"
+SC_ID_COL       = "scorecard_id"
+SOURCE_NEW      = monthly_filtered       # new source  (PDW / new place)
+SOURCE_OLD      = quarterly_filtered     # old source  (MRD / original)
+LABEL_NEW       = "Monthly (New Source)"
+LABEL_OLD       = "Quarterly (Old 
+DEC_2025_START  = pd.to_datetime("2025-12-01")
+DEC_2025_END    = pd.to_datetime("2025-12-31")
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPER UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def style_sheet(ws, title_color="1F4E79"):
+    """Apply consistent header styling to a worksheet."""
+    header_fill = PatternFill("solid", fgColor=title_color)
+    header_font = Font(color="FFFFFF", bold=True, size=10)
+    thin = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+        cell.border = border
+    # Auto-width (capped at 40)
+    for col in ws.columns:
+        max_len = max((len(str(c.value or "")) for c in col), default=0)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 40)
+
+def flag_fill(ws, col_letter, start_row, values, bad_val=True, color="FFC7CE"):
+    """Red-fill cells where values match bad_val."""
+    red = PatternFill("solid", fgColor=color)
+    for i, v in enumerate(values, start=start_row):
+        if v == bad_val or (isinstance(v, float) and bad_val == True and v > 0):
+            ws[f"{col_letter}{i}"].fill = red
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. ROW COUNTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def check_row_counts(new_df, old_df):
+    new_cnt = len(new_df)
+    old_cnt = len(old_df)
+    diff    = new_cnt - old_cnt
+    pct     = round(diff / old_cnt * 100, 2) if old_cnt else None
+    result  = pd.DataFrame([{
+        "Check"           : "Total Row Count",
+        LABEL_NEW         : new_cnt,
+        LABEL_OLD         : old_cnt,
+        "Difference"      : diff,
+        "Diff %"          : pct,
+        "Status"          : "⚠ MISMATCH" if diff != 0 else "✓ MATCH",
+        "Remarks"         : f"New has {abs(diff):,} {'more' if diff>0 else 'fewer'} rows"
+    }])
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. APPROVAL DATE RANGE CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+
+def check_approval_date(new_df, old_df, date_col):
+    rows = []
+    for label, df in [(LABEL_NEW, new_df), (LABEL_OLD, old_df)]:
+        s = pd.to_datetime(df[date_col])
+        rows.append({
+            "Source"    : label,
+            "Min Date"  : s.min(),
+            "Max Date"  : s.max(),
+            "Null Count": s.isna().sum(),
+            "Future Dates (> today)": (s > pd.Timestamp.today()).sum(),
+            "Dates < 1990": (s < pd.to_datetime("1990-01-01")).sum(),
+        })
+    result = pd.DataFrame(rows)
+    result["Status"] = result.apply(
+        lambda r: "⚠ CHECK" if r["Null Count"] > 0 or r["Future Dates (> today)"] > 0 else "✓ OK",
+        axis=1
+    )
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. MONTHLY RECORD COUNTS + LAST-MONTH vs THIS-MONTH DIFF
+# ══════════════════════════════════════════════════════════════════════════════
+
+def check_monthly_trend(new_df, old_df, date_col):
+    def monthly_counts(df, label):
+        s = pd.to_datetime(df[date_col])
+        cnt = s.dt.to_period("M").value_counts().sort_index().reset_index()
+        cnt.columns = ["Month", label]
+        return cnt
+
+    new_m = monthly_counts(new_df, LABEL_NEW)
+    old_m = monthly_counts(old_df, LABEL_OLD)
+    merged = pd.merge(new_m, old_m, on="Month", how="outer").sort_values("Month")
+    merged["Diff"]   = merged[LABEL_NEW].fillna(0) - merged[LABEL_OLD].fillna(0)
+    merged["Diff %"] = (merged["Diff"] / merged[LABEL_OLD].replace(0, np.nan) * 100).round(2)
+
+    # Last month vs this month diff (within new source)
+    new_sorted = new_m.sort_values("Month")
+    new_sorted["MoM_Diff"]   = new_sorted[LABEL_NEW].diff()
+    new_sorted["MoM_Diff %"] = new_sorted[LABEL_NEW].pct_change().mul(100).round(2)
+
+    merged = pd.merge(merged, new_sorted[["Month","MoM_Diff","MoM_Diff %"]], on="Month", how="left")
+    merged["Status"] = merged["Diff"].apply(lambda x: "⚠ MISMATCH" if x != 0 else "✓ MATCH")
+    merged["Month"]  = merged["Month"].astype(str)
+    return merged
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. ROLLING AVERAGES (1-month, 3-month)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def check_rolling_avg(monthly_trend_df):
+    df = monthly_trend_df.copy()
+    df[f"{LABEL_NEW}_1M_avg"]  = df[LABEL_NEW].rolling(1).mean().round(0)
+    df[f"{LABEL_NEW}_3M_avg"]  = df[LABEL_NEW].rolling(3).mean().round(0)
+    df[f"{LABEL_OLD}_1M_avg"]  = df[LABEL_OLD].rolling(1).mean().round(0)
+    df[f"{LABEL_OLD}_3M_avg"]  = df[LABEL_OLD].rolling(3).mean().round(0)
+    df["1M_avg_diff"]  = (df[f"{LABEL_NEW}_1M_avg"] - df[f"{LABEL_OLD}_1M_avg"]).round(0)
+    df["3M_avg_diff"]  = (df[f"{LABEL_NEW}_3M_avg"] - df[f"{LABEL_OLD}_3M_avg"]).round(0)
+    df["3M_avg_status"] = df["3M_avg_diff"].apply(
+        lambda x: "⚠ LARGE DIFF" if abs(x) > 50000 else "✓ SIMILAR" if pd.notna(x) else "-"
+    )
+    keep_cols = ["Month", LABEL_NEW, LABEL_OLD,
+                 f"{LABEL_NEW}_3M_avg", f"{LABEL_OLD}_3M_avg",
+                 "3M_avg_diff", "3M_avg_status",
+                 "MoM_Diff", "MoM_Diff %"]
+    return df[[c for c in keep_cols if c in df.columns]]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. DUPLICATE CHECK (focus on Dec 2025)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def check_duplicates(new_df, old_df, date_col, sc_id_col):
+    rows = []
+    for label, df in [(LABEL_NEW, new_df), (LABEL_OLD, old_df)]:
+        # Overall duplicates
+        dup_all = df.duplicated(subset=[sc_id_col]).sum()
+        # Dec 2025 duplicates
+        mask_dec = (pd.to_datetime(df[date_col]) >= DEC_2025_START) & \
+                   (pd.to_datetime(df[date_col]) <= DEC_2025_END)
+        df_dec   = df[mask_dec]
+        dup_dec  = df_dec.duplicated(subset=[sc_id_col]).sum()
+        rows.append({
+            "Source"                   : label,
+            "Total Rows"               : len(df),
+            "Duplicate SC_IDs (All)"   : dup_all,
+            "Dec 2025 Rows"            : len(df_dec),
+            "Duplicate SC_IDs (Dec 25)": dup_dec,
+            "Status"                   : "⚠ HAS DUPS" if dup_all > 0 else "✓ CLEAN"
+        })
+    return pd.DataFrame(rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. COMMON SCORECARD_IDs – MISSING & EXTRA
+# ══════════════════════════════════════════════════════════════════════════════
+
+def check_sc_id_overlap(new_df, old_df, sc_id_col):
+    new_ids = set(new_df[sc_id_col].astype(str))
+    old_ids = set(old_df[sc_id_col].astype(str))
+    common  = new_ids & old_ids
+    only_new = new_ids - old_ids          # in new but not old  → "enhancement / extra"
+    only_old = old_ids - new_ids          # in old but not new  → "missing / dropped"
+    result = pd.DataFrame([{
+        "Total in New Source"       : len(new_ids),
+        "Total in Old Source"       : len(old_ids),
+        "Common IDs"                : len(common),
+        "Only in New (extra)"       : len(only_new),
+        "Only in Old (missing)"     : len(only_old),
+        "Match %"                   : round(len(common) / len(old_ids) * 100, 2) if old_ids else None,
+        "Status"                    : "⚠ DIFF" if only_new or only_old else "✓ SAME"
+    }])
+    # Sample missing IDs
+    sample_missing = pd.DataFrame({"Scorecard_ID_missing_in_new": list(only_old)[:500]})
+    sample_extra   = pd.DataFrame({"Scorecard_ID_extra_in_new"  : list(only_new)[:500]})
+    return result, sample_missing, sample_extra
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. CELL-TO-CELL VALUE COMPARISON (on common IDs)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def cell_to_cell_compare(new_df, old_df, sc_id_col, date_col,
+                         focus_start=DEC_2025_START, focus_end=DEC_2025_END):
+    """
+    For each column: count nulls, value mismatches, type mismatches.
+    Also does a deep Dec-2025 cell-level compare.
+    """
+    # Align on common IDs
+    common_ids = set(new_df[sc_id_col].astype(str)) & set(old_df[sc_id_col].astype(str))
+    new_sub = new_df[new_df[sc_id_col].astype(str).isin(common_ids)].copy()
+    old_sub = old_df[old_df[sc_id_col].astype(str).isin(common_ids)].copy()
+    new_sub = new_sub.sort_values(sc_id_col).reset_index(drop=True)
+    old_sub = old_sub.sort_values(sc_id_col).reset_index(drop=True)
+
+    cols = [c for c in new_sub.columns if c in old_sub.columns]
+    rows = []
+    for col in cols:
+        n_col = new_sub[col]
+        o_col = old_sub[col]
+        both_null  = (n_col.isna() & o_col.isna()).sum()
+        new_null   = (n_col.isna() & o_col.notna()).sum()   # null in new, value in old
+        old_null   = (n_col.notna() & o_col.isna()).sum()   # value in new, null in old
+        # Value mismatch (where both not null)
+        both_notna = n_col.notna() & o_col.notna()
+        try:
+            mismatch = (n_col[both_notna].astype(str) != o_col[both_notna].astype(str)).sum()
+        except Exception:
+            mismatch = None
+        rows.append({
+            "Column"                      : col,
+            "New dtype"                   : str(n_col.dtype),
+            "Old dtype"                   : str(o_col.dtype),
+            "Type Changed"                : str(n_col.dtype) != str(o_col.dtype),
+            "Both Null"                   : int(both_null),
+            "Null in New (val in Old)"    : int(new_null),
+            "Val in New (null in Old)"    : int(old_null),
+            "Value Mismatch (both notna)" : mismatch,
+            "Total Common Rows"           : len(new_sub),
+            "Mismatch %"                  : round(mismatch / len(new_sub) * 100, 2) if mismatch else 0,
+            "Issue Type"                  : (
+                "NULL→VALUE" if new_null > 0 and mismatch == 0 else
+                "VALUE→NULL" if old_null > 0 and mismatch == 0 else
+                "VALUE MISMATCH" if mismatch and mismatch > 0 else
+                "TYPE CHANGE" if str(n_col.dtype) != str(o_col.dtype) else
+                "✓ CLEAN"
+            )
+        })
+
+    col_compare = pd.DataFrame(rows).sort_values("Mismatch %", ascending=False)
+
+    # ── Dec 2025 deep-dive: sample rows with any difference ──────────────────
+    new_dec = new_sub[
+        (pd.to_datetime(new_sub[date_col]) >= focus_start) &
+        (pd.to_datetime(new_sub[date_col]) <= focus_end)
+    ].copy()
+    old_dec = old_sub[old_sub[sc_id_col].isin(new_dec[sc_id_col])].copy()
+    new_dec = new_dec.set_index(sc_id_col)
+    old_dec = old_dec.set_index(sc_id_col)
+
+    diff_mask   = (new_dec.astype(str) != old_dec.astype(str))
+    rows_w_diff = diff_mask.any(axis=1)
+    sample_diff = new_dec[rows_w_diff].head(200).reset_index()
+    sample_diff.insert(1, "__source__", "NEW")
+    old_sample  = old_dec[rows_w_diff].head(200).reset_index()
+    old_sample.insert(1, "__source__", "OLD")
+    dec_sample  = pd.concat([sample_diff, old_sample]).sort_values([sc_id_col, "__source__"])
+
+    return col_compare, dec_sample
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. FILL RATE COMPARISON  (from your existing cal_fill_rate logic)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compare_fill_rates(new_df, old_df):
+    def fill_rate(df):
+        return (df.notna().sum() / len(df) * 100).round(2)
+    new_fr = fill_rate(new_df).rename("New Fill %")
+    old_fr = fill_rate(old_df).rename("Old Fill %")
+    fr = pd.concat([new_fr, old_fr], axis=1).reset_index()
+    fr.columns = ["Column", "New Fill %", "Old Fill %"]
+    fr["Diff"] = (fr["New Fill %"] - fr["Old Fill %"]).round(2)
+    fr["Status"] = fr["Diff"].apply(
+        lambda x: "⚠ FILL DROP >5%" if x < -5 else
+                  "⬆ FILL IMPROVED" if x > 5 else "✓ SIMILAR"
+    )
+    return fr.sort_values("Diff")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. SUMMARY SCORECARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_summary(row_df, date_df, monthly_df, dup_df, sc_id_df, col_compare_df):
+    issues = []
+    # Row count
+    rc = row_df.iloc[0]
+    issues.append({"Section":"Row Count","Finding": rc["Status"],
+                   "Detail": f"Diff = {rc['Difference']:,} ({rc['Diff %']}%)"})
+    # Duplicates
+    for _, r in dup_df.iterrows():
+        if r["Duplicate SC_IDs (All)"] > 0:
+            issues.append({"Section":"Duplicates","Finding":"⚠ DUPLICATES FOUND",
+                           "Detail": f"{r['Source']}: {r['Duplicate SC_IDs (All)']:,} dup SC_IDs"})
+    # SC_ID overlap
+    sc = sc_id_df.iloc[0]
+    if sc["Only in New (extra)"] > 0:
+        issues.append({"Section":"SC_ID Overlap","Finding":"⚠ EXTRA IDs in New",
+                       "Detail": f"{sc['Only in New (extra)']:,} IDs only in new source (possible enhancement)"})
+    if sc["Only in Old (missing)"] > 0:
+        issues.append({"Section":"SC_ID Overlap","Finding":"⚠ MISSING IDs in New",
+                       "Detail": f"{sc['Only in Old (missing)']:,} IDs dropped from new source"})
+    # Column mismatches
+    bad_cols = col_compare_df[col_compare_df["Issue Type"] != "✓ CLEAN"]
+    issues.append({"Section":"Column Compare","Finding":
+                   f"⚠ {len(bad_cols)} columns with issues" if len(bad_cols)>0 else "✓ All columns clean",
+                   "Detail": ", ".join(bad_cols["Column"].head(10).tolist())})
+    return pd.DataFrame(issues)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MASTER RUNNER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_dq_and_export():
+    print("Running DQ checks...")
+
+    row_df       = check_row_counts(SOURCE_NEW, SOURCE_OLD)
+    date_df      = check_approval_date(SOURCE_NEW, SOURCE_OLD, DATE_COL)
+    monthly_df   = check_monthly_trend(SOURCE_NEW, SOURCE_OLD, DATE_COL)
+    rolling_df   = check_rolling_avg(monthly_df)
+    dup_df       = check_duplicates(SOURCE_NEW, SOURCE_OLD, DATE_COL, SC_ID_COL)
+    sc_id_df, missing_ids, extra_ids = check_sc_id_overlap(SOURCE_NEW, SOURCE_OLD, SC_ID_COL)
+    col_compare, dec_sample = cell_to_cell_compare(SOURCE_NEW, SOURCE_OLD, SC_ID_COL, DATE_COL)
+    fill_df      = compare_fill_rates(SOURCE_NEW, SOURCE_OLD)
+    summary_df   = build_summary(row_df, date_df, monthly_df, dup_df, sc_id_df, col_compare)
+
+    print("Writing Excel report...")
+    with pd.ExcelWriter(REPORT_PATH, engine="openpyxl") as writer:
+
+        sheets = {
+            "00_SUMMARY"           : summary_df,
+            "01_Row_Counts"        : row_df,
+            "02_Approval_Date"     : date_df,
+            "03_Monthly_Trend"     : monthly_df,
+            "04_Rolling_Avg"       : rolling_df,
+            "05_Duplicates"        : dup_df,
+            "06_SC_ID_Overlap"     : sc_id_df,
+            "07_Missing_IDs"       : missing_ids,
+            "08_Extra_IDs"         : extra_ids,
+            "09_Column_Compare"    : col_compare,
+            "10_Dec2025_Sample"    : dec_sample,
+            "11_Fill_Rate"         : fill_df,
+        }
+        for sheet_name, df in sheets.items():
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    # ── Post-process styling ──────────────────────────────────────────────────
+    wb = load_workbook(REPORT_PATH)
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        style_sheet(ws)
+        # Red-fill ⚠ status cells
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                if cell.value and isinstance(cell.value, str) and "⚠" in cell.value:
+                    cell.fill = PatternFill("solid", fgColor="FFC7CE")
+                    cell.font = Font(color="9C0006", bold=True)
+                elif cell.value and isinstance(cell.value, str) and "✓" in cell.value:
+                    cell.fill = PatternFill("solid", fgColor="C6EFCE")
+                    cell.font = Font(color="276221", bold=True)
+
+    # Freeze panes & tab colours
+    colors = ["1F4E79","2E75B6","4472C4","5B9BD5","70AD47",
+              "ED7D31","FFC000","FF0000","C00000","7030A0","0070C0","00B0F0"]
+    for i, name in enumerate(wb.sheetnames):
+        ws = wb[name]
+        ws.freeze_panes = "B2"
+        ws.sheet_properties.tabColor = colors[i % len(colors)]
+
+    wb.save(REPORT_PATH)
+    print(f"\n✅ DQ Report saved → {REPORT_PATH}")
+    print("\nSheets written:")
+    for k in sheets:
+        print(f"  {k}: {len(sheets[k])} rows")
+    return sheets
+
+# ── RUN ───────────────────────────────────────────────────────────────────────
+results = run_dq_and_export()
